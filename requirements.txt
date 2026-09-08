@@ -1,0 +1,23 @@
+# Gravity Spy glitch classification — dependencies
+# Verified with Python 3.12.
+#
+# PyTorch: the versions below are CPU builds. For a CPU-only install use the
+# official CPU wheel index (smaller download, no CUDA):
+#
+#     pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cpu
+#     pip install -r requirements.txt
+#
+# For a GPU machine, install the CUDA build of torch/torchvision that matches
+# your CUDA version (see https://pytorch.org/get-started/locally/) INSTEAD of the
+# CPU line above, then run `pip install -r requirements.txt` for the rest.
+
+torch==2.14.0
+torchvision==0.29.0
+timm==1.0.29
+
+numpy==2.3.3
+pandas==2.3.3
+scikit-learn==1.8.0
+matplotlib==3.10.8
+h5py==3.14.0
+pillow==12.1.1

@@ -1,0 +1,2 @@
+model,test_n,accuracy,macro_f1,weighted_f1,macro_precision,macro_recall,val_macro_f1
+custom_cnn,1179,0.9059,0.8397,0.9114,0.8337,0.8738,0.8695
