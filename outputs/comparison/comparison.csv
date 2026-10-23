@@ -1,0 +1,2 @@
+model,macro_f1,accuracy,balanced_accuracy,weighted_f1,macro_precision,macro_recall,n_parameters,epochs
+custom_cnn,0.933244,0.968617,0.926698,0.968441,0.951069,0.926698,2359542,57

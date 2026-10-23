@@ -1,97 +1,96 @@
-# RUNBOOK — running the official model comparison
+# RUNBOOK — the official three-model comparison
 
-For the maintainer (Cavey) who runs the official training on the RTX 5070 after
-teammates push their model files. Teammate instructions are in
-[README.md](README.md) → CONTRIBUTING.
-
-All commands run from the repo root (`gravity-spy/`).
+Step-by-step for whoever runs the official training (the RTX 5070 machine).
+All commands run from the repo root.
 
 ---
 
-## Step 1 — Pull the teammates' model files
+## Step 1 — Get the latest code
 ```bash
 git pull origin main
 ```
-Brings in `models/transfer_cnn.py` and `models/transformer.py`. Does **not** touch
-your local dataset or checkpoints (they are gitignored).
+The dataset and checkpoints are gitignored, so this never touches them.
 
-## Step 2 — Sanity-check both models build
+## Step 2 — Check all three models build and train
 ```bash
-python -c "from models.registry import available_models, build_model; import config; print(available_models()); [build_model(m, config.NUM_CLASSES, pretrained=False) for m in ['transfer_cnn','transformer']]; print('both build OK')"
+python train.py --list-models
+python scripts/smoke_test.py --all-models
 ```
-Catches a leftover `raise NotImplementedError`, a syntax error, or a bad backbone
-name before you spend GPU time.
+The smoke test trains and evaluates every model for 1–2 epochs on synthetic data,
+so a broken model fails here in a minute instead of after an hour of GPU time.
+The first run downloads the pretrained weights (~85 MB EfficientNet, ~110 MB Swin).
 
-## Step 3 — Confirm GPU + data are ready
+## Step 3 — Check the GPU and data
 ```bash
-python -c "import torch; print('GPU:', torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-python -m data.inspect_data --no-grid --h5-tree
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+python data/inspect_data.py --show-augmented
 ```
-Expect `GPU: True NVIDIA GeForce RTX 5070` and counts train=5587 / val=1200 / test=1179.
-The dataset is already at `dataset/trainingsetv1d1.h5` — nothing to re-download.
+Expect `True NVIDIA GeForce RTX 5070`, and train=5587 / validation=1200 /
+test=1179 with 134 blank images reported.
 
-## Step 4 — Train + evaluate each model on the 5070
+## Step 4 — Train and evaluate each model
 ```bash
-python train.py    --model transfer_cnn --num-workers 4 --lr 1e-4
-python evaluate.py --model transfer_cnn --num-workers 4
+python train.py    --model custom_cnn
+python evaluate.py --model custom_cnn
 
-python train.py    --model transformer  --num-workers 4 --lr 1e-4
-python evaluate.py --model transformer  --num-workers 4
+python train.py    --model transfer_cnn --lr 1e-4 --epochs 25
+python evaluate.py --model transfer_cnn
+
+python train.py    --model transformer  --lr 3e-5 --epochs 20 --weight-decay 0.05
+python evaluate.py --model transformer
 ```
-`--lr 1e-4` because pretrained backbones fine-tune (a gentler LR than the
-from-scratch baseline's default 3e-4). Justify this choice in the report — it is a
-permitted, deliberate per-architecture difference, not an unfair advantage.
+The pretrained models use a lower learning rate than the from-scratch baseline
+because fine-tuning must not wash out the pretrained weights. This is a permitted,
+justified per-architecture difference (spec §6) — say so in the report.
 
-Your baseline (`custom_cnn`) is already trained; re-run it only if you change the
-data or config:
-```bash
-python train.py --model custom_cnn --num-workers 4
-python evaluate.py --model custom_cnn --num-workers 4
-```
+Everything else is identical for all three: the same split, seed (42), class
+weighting, augmentation and early stopping on validation macro-F1.
 
-## Step 5 — Build the 3-model comparison
+**Do not pass `--drop-blank-images` for one model and not the others.**
+`compare.py` refuses to compare runs that disagree on it.
+
+## Step 5 — Build the comparison
 ```bash
 python compare.py
 ```
-Produces `outputs/comparison.csv`, `comparison.md`, `comparison_macro_f1.png`.
 
-## Step 6 — Commit the results back
+## Step 6 — Commit the results
 ```bash
 git add outputs/
-git commit -m "Add trained results for all three models + comparison"
+git commit -m "Add trained results for all three models"
 git push origin main
 ```
-Only small result files are committed; `*.pt` checkpoints stay local (gitignore).
+Checkpoints (`*.pt`) stay local via `.gitignore`; only the small result files and
+figures are committed.
 
 ---
 
 ## Where everything lands
 
-| What | Location | Committed to git? |
+| What | Location | In git? |
 |---|---|---|
-| Dataset (already present) | `dataset/trainingsetv1d1.h5`, `dataset/trainingset_v1d1_metadata.csv` | No (gitignored) |
-| Pretrained weights (first run downloads ~80–110 MB) | timm cache: `C:\Users\<you>\.cache\huggingface\` | No (cache) |
-| Per-model results | `outputs/<model>/` — `checkpoint_best.pt`, `metrics.json`, `per_class_metrics.csv`, `confusion_matrix.png`, `training_curves.png`, `examples_correct.png`, `examples_incorrect.png`, `run_config.json`, `history.json` | Yes, except `*.pt` |
-| Comparison | `outputs/comparison.csv`, `comparison.md`, `comparison_macro_f1.png` | Yes |
+| Dataset | `dataset/trainingsetv1d1.h5` | No |
+| Pretrained weights | `C:\Users\<you>\.cache\huggingface\` | No |
+| Per-model results | `outputs/<model>/` — `metrics.json`, `per_class_metrics.md/.csv`, `predictions.csv`, `confusion_matrix.png`, `training_curves.png`, `examples_correct.png`, `examples_incorrect.png`, `config.json`, `env.json`, `history.json` | Yes |
+| Checkpoints | `outputs/<model>/checkpoint_best.pt`, `checkpoint_last.pt` | No |
+| Comparison | `outputs/comparison/` — `comparison.md`, `comparison.csv`, `model_comparison.png` | Yes |
 
-`metrics.json` is the file `compare.py` reads. `macro_f1` is the headline metric
-(accuracy is inflated by the 67× class imbalance).
+`config.json` and `env.json` together record exactly how each run was made:
+every setting, library versions, GPU model and memory (spec §7.3).
 
 ---
 
 ## Troubleshooting
 
-- **Out-of-memory / Windows worker hang on the transformer** (it is ~28M params +
-  attention, much heavier than the baseline): drop to `--num-workers 0` and/or
-  `--batch-size 32`. Everything else stays the same.
-- **A teammate's model errors on input shape:** their backbone likely isn't
-  224×224-native. The recommended picks (EfficientNetV2-S, Swin-Tiny) are — the
-  shared transforms output 3-channel 224×224.
-- **`compare.py` shows only some models:** it only lists models that have been
-  evaluated. Run `evaluate.py --model <name>` for any missing one.
-- **Reproducing a past run:** every run's exact versions + config are in
-  `outputs/<model>/run_config.json`.
+- **CUDA out-of-memory on the transformer:** `--batch-size 32`, then 16.
+- **Windows DataLoader hangs:** `--num-workers 0`.
+- **`compare.py` shows fewer than three models:** it lists only evaluated
+  models. Run `evaluate.py --model <name>` for the missing one.
+- **`compare.py` refuses to compare:** two models were run with different
+  `--drop-blank-images` settings or on different splits. Re-run to match.
 
-## Reference results (baseline)
-`custom_cnn`, full run on RTX 5070: **test macro-F1 0.840, accuracy 0.906**
-(best val macro-F1 0.870 @ epoch 19, early-stopped at 26).
+## Reference result
+
+`custom_cnn` on the RTX 5070: **test macro-F1 0.9332, accuracy 0.9686**
+(best validation macro-F1 0.9489 at epoch 45, early-stopped at epoch 57).
+This reproduces exactly with seed 42.

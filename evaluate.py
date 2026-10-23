@@ -1,198 +1,230 @@
-"""
-evaluate.py — Load a trained checkpoint, run the TEST set, save all metrics.
-
-Model-agnostic: it reads the model NAME from the checkpoint and rebuilds via the
-registry, so the same command evaluates any of the three models.
+"""Evaluate a checkpoint on the test set.
 
     python evaluate.py --model custom_cnn
-    python evaluate.py --model transformer --split test
 
-Outputs (all into outputs/<model>/):
-    metrics.json            accuracy, macro-F1, per-class P/R/F1, confusion, ...
-    per_class_metrics.csv   the per-class table, spreadsheet-friendly
-    confusion_matrix.png    row-normalized heatmap
-    examples_correct.png    grid of correct predictions
-    examples_incorrect.png  grid of mistakes
+Reads the model name, input size and training config out of the checkpoint, so
+it works for any registered model without changes.
 
-NOTE ON METRICS: overall ACCURACY will look high (~97-98%) because the big
-classes (Blip) dominate. That is expected. MACRO-F1 is the HEADLINE metric --
-it averages per-class F1 equally, so rare classes count fully.
+Writes to outputs/<model>/: metrics.json, per_class_metrics.md/.csv,
+predictions.csv, confusion_matrix.png, examples_correct.png,
+examples_incorrect.png, training_curves.png
+
+Expect accuracy around 97%. Report MACRO-F1: the class distribution is skewed
+enough that accuracy stays high regardless of how the rare classes are handled.
 """
 
+from __future__ import annotations
+
 import argparse
+import csv
 import json
-import random
+import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
 
-import config
-from data.dataset import GravitySpyDataset
-from models.registry import build_model
-from utils.metrics import full_report
-from utils.plotting import plot_confusion_matrix, plot_prediction_examples
-from utils.seed import set_seed
+from config import CLASSES, NUM_CLASSES, Config
+from data.dataset import build_dataloaders
+from data.transforms import normalisation_stats
+from models import registry
+from utils.metrics import compute_metrics, per_class_table
+from utils.plotting import plot_confusion_matrix, plot_example_grid, plot_training_curves
+from utils.seeding import resolve_device, set_seed
 
-
-def load_checkpoint(path: Path):
-    """Load a checkpoint saved by train.py (weights_only=False: it holds a dict)."""
-    if not path.exists():
-        raise FileNotFoundError(
-            f"Checkpoint not found at {path}. Train first: "
-            f"python train.py --model <name>"
-        )
-    return torch.load(path, map_location="cpu", weights_only=False)
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(it, **kw):
+        return it
 
 
 @torch.no_grad()
-def run_inference(model, loader, device, max_batches=None):
-    """Return parallel lists (index, y_true, y_pred) over the loader.
-
-    Because the loader is unshuffled, the running counter equals the dataset
-    index -- we keep it so we can fetch the original spectrogram for the grids.
-    """
+def run_inference(model, loader, device) -> Dict[str, Any]:
+    """Run the model over a split, keeping images so the example grids can be
+    drawn without a second pass over the data."""
     model.eval()
-    idxs, y_true, y_pred = [], [], []
-    running = 0
-    for b, (x, y) in enumerate(loader):
-        if max_batches is not None and b >= max_batches:
-            break
-        x = x.to(device)
-        logits = model(x)
-        preds = logits.argmax(1).cpu().tolist()
-        n = len(preds)
-        idxs.extend(range(running, running + n))
-        running += n
-        y_true.extend(y.tolist())
-        y_pred.extend(preds)
-    return idxs, y_true, y_pred
+    logits, targets, ids, images = [], [], [], []
+    for batch_images, batch_targets, batch_ids in tqdm(loader, desc="inference"):
+        # No autocast: evaluation is cheap and full fp32 keeps the saved
+        # probabilities exactly reproducible.
+        out = model(batch_images.to(device, non_blocking=True)).float().cpu()
+        logits.append(out.numpy())
+        targets.extend(batch_targets.tolist())
+        ids.extend(list(batch_ids))
+        images.append(batch_images.numpy())
+
+    probs = F.softmax(torch.from_numpy(np.concatenate(logits)), dim=1).numpy()
+    return {"probs": probs, "preds": probs.argmax(1),
+            "targets": np.array(targets), "ids": ids,
+            "images": np.concatenate(images)}
 
 
-def pick_examples(idxs, y_true, y_pred, n_each, seed):
-    """Return (correct_idx, incorrect_idx) samples of up to n_each dataset indices."""
-    rng = random.Random(seed)
-    correct = [i for i, t, p in zip(idxs, y_true, y_pred) if t == p]
-    wrong = [i for i, t, p in zip(idxs, y_true, y_pred) if t != p]
-    rng.shuffle(correct)
-    rng.shuffle(wrong)
-    return correct[:n_each], wrong[:n_each]
+def select_examples(results, n: int, correct: bool):
+    """Pick examples for the figures.
+
+    Correct ones are spread across different classes -- taking the top n by
+    confidence would show eight Blips and teach nothing. Incorrect ones are the
+    MOST CONFIDENT mistakes, which are the informative ones: a confident error
+    shows what the model genuinely misunderstood.
+    """
+    preds, targets = results["preds"], results["targets"]
+    confidences = results["probs"].max(1)
+    idx = np.flatnonzero((preds == targets) if correct else (preds != targets))
+    if idx.size == 0:
+        return [], [], [], []
+
+    if correct:
+        by_class: Dict[int, List[int]] = {}
+        for i in idx:
+            by_class.setdefault(int(targets[i]), []).append(int(i))
+        chosen, rank = [], 0
+        while len(chosen) < n:
+            added = False
+            for cls in sorted(by_class):
+                if rank < len(by_class[cls]):
+                    chosen.append(by_class[cls][rank])
+                    added = True
+                    if len(chosen) >= n:
+                        break
+            if not added:
+                break
+            rank += 1
+        selected = chosen[:n]
+    else:
+        selected = list(idx[np.argsort(-confidences[idx])][:n])
+
+    return ([results["images"][i] for i in selected],
+            [CLASSES[int(targets[i])] for i in selected],
+            [CLASSES[int(preds[i])] for i in selected],
+            [float(confidences[i]) for i in selected])
 
 
-def save_example_grid(ds, chosen_idx, y_true, y_pred, out_path, title):
-    """Load raw spectrograms for chosen indices and save a labeled grid."""
-    if not chosen_idx:
-        print(f"[eval] no examples for {out_path.name} (none in this category)")
-        return
-    # y_true/y_pred are aligned with the full index list; build lookup by index.
-    true_by_idx = dict(zip(range(len(y_true)), y_true))
-    pred_by_idx = dict(zip(range(len(y_pred)), y_pred))
-    images = [ds.raw_image(i) for i in chosen_idx]
-    trues = [true_by_idx[i] for i in chosen_idx]
-    preds = [pred_by_idx[i] for i in chosen_idx]
-    plot_prediction_examples(images, trues, preds, config.CLASSES, out_path, title)
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(description="Evaluate a trained model.")
+    p.add_argument("--model", required=True)
+    p.add_argument("--checkpoint", type=Path, default=None)
+    p.add_argument("--split", default="test", choices=("test", "validation", "train"))
+    p.add_argument("--data-root", type=Path, default=None)
+    p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--device", choices=("auto", "cuda", "cpu"), default=None)
+    p.add_argument("--n-examples", type=int, default=8)
+    p.add_argument("--output-root", type=Path, default=None)
+    args = p.parse_args(argv)
 
+    out_dir = Path(args.output_root or Config().output_root) / args.model
+    ckpt_path = args.checkpoint or (out_dir / "checkpoint_best.pt")
+    if not ckpt_path.exists():
+        print("error: no checkpoint at %s. Run:\n  python train.py --model %s"
+              % (ckpt_path, args.model), file=sys.stderr)
+        return 2
 
-def main():
-    ap = argparse.ArgumentParser(description="Evaluate a trained model on the test set.")
-    ap.add_argument("--model", required=True, help="model name (must match training)")
-    ap.add_argument("--checkpoint", default=None,
-                    help="path to checkpoint (default outputs/<model>/checkpoint_best.pt)")
-    ap.add_argument("--split", default="test", choices=["train", "val", "test"])
-    ap.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
-    ap.add_argument("--num-workers", type=int, default=config.NUM_WORKERS)
-    ap.add_argument("--seed", type=int, default=config.SEED)
-    ap.add_argument("--n-examples", type=int, default=10,
-                    help="how many correct and incorrect examples to plot")
-    ap.add_argument("--h5-path", default=None)
-    ap.add_argument("--metadata-csv", default=None)
-    ap.add_argument("--max-batches", type=int, default=None, help="smoke tests only")
-    args = ap.parse_args()
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    # The training config travels with the checkpoint, so evaluation
+    # automatically uses the same duration, normalisation and blank-image setting.
+    cfg = Config.from_dict(ckpt["config"]).apply_overrides(
+        data_root=args.data_root, num_workers=args.num_workers,
+        device=args.device, output_root=args.output_root)
+    input_size = tuple(ckpt["input_size"])
+    class_names = ckpt["class_names"]
 
-    set_seed(args.seed)
-    device = config.get_device()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    set_seed(cfg.seed)
+    device = resolve_device(cfg.device)
 
-    ckpt_path = Path(args.checkpoint) if args.checkpoint \
-        else config.OUTPUTS_ROOT / args.model / "checkpoint_best.pt"
-    ckpt = load_checkpoint(ckpt_path)
-    model_name = ckpt.get("model_name", args.model)
-    best_f1 = ckpt.get("best_val_macro_f1")
-    best_f1_str = f"{best_f1:.4f}" if best_f1 is not None else "n/a"
-    print(f"[eval] model={model_name}  checkpoint={ckpt_path.name}  "
-          f"trained_best_val_macroF1={best_f1_str}")
+    print("=" * 66)
+    print("Evaluating '%s' on the %s split" % (args.model, args.split))
+    print("=" * 66)
+    print("checkpoint : %s (epoch %s)" % (ckpt_path, ckpt.get("epoch")))
 
-    # Rebuild via registry (pretrained=False; we load the trained weights next).
-    model = build_model(model_name, num_classes=ckpt["num_classes"], pretrained=False)
+    loaders, grouped, _ = build_dataloaders(cfg, input_size, splits=(args.split,),
+                                            shuffle_train=False)
+    print("samples    : %d" % len(grouped[args.split]))
+
+    # pretrained=False: every weight is about to be overwritten from the
+    # checkpoint, so downloading ImageNet weights first would be wasted.
+    model = registry.build_model(args.model, NUM_CLASSES, pretrained=False)
     model.load_state_dict(ckpt["state_dict"])
     model.to(device)
 
-    # Test data: use the same duration/loader the model was trained with.
-    ds = GravitySpyDataset(
-        args.split,
-        loader=ckpt.get("loader", config.LOADER),
-        duration=ckpt.get("duration", config.DURATION),
-        h5_path=Path(args.h5_path) if args.h5_path else None,
-        metadata_csv=Path(args.metadata_csv) if args.metadata_csv else None,
-    )
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False,
-                        num_workers=args.num_workers,
-                        pin_memory=torch.cuda.is_available())
-    print(f"[eval] {args.split} samples: {len(ds)}")
+    results = run_inference(model, loaders[args.split], device)
+    metrics = compute_metrics(results["targets"], results["preds"], class_names)
+    metrics.update({
+        "model": args.model, "split": args.split,
+        "checkpoint_epoch": ckpt.get("epoch"), "input_size": list(input_size),
+        "duration": cfg.duration, "seed": cfg.seed,
+        "pretrained": bool(cfg.pretrained),
+        "class_weighted_loss": bool(cfg.class_weights),
+        "drop_blank_images": bool(cfg.drop_blank_images),
+        "n_parameters": int(sum(p.numel() for p in model.parameters())),
+    })
 
-    idxs, y_true, y_pred = run_inference(model, loader, device, args.max_batches)
+    history_path = out_dir / "history.json"
+    if history_path.exists():
+        history = json.loads(history_path.read_text(encoding="utf-8"))
+        metrics["epochs_trained"] = len(history["train_loss"])
+        metrics["best_epoch"] = history.get("best_epoch")
+        plot_training_curves(history, out_dir / "training_curves.png",
+                             "%s -- training history" % args.model)
 
-    # ---- metrics ----
-    report = full_report(y_true, y_pred, config.CLASSES)
-    out_dir = config.OUTPUTS_ROOT / model_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2),
+                                          encoding="utf-8")
+    (out_dir / "per_class_metrics.md").write_text(
+        "# Per-class metrics -- %s (%s split)\n\n%s\n"
+        % (args.model, args.split, per_class_table(metrics)), encoding="utf-8")
 
-    metrics = {
-        "model_name": model_name,
-        "split": args.split,
-        "n_samples": len(y_true),
-        "checkpoint": {
-            "best_epoch": ckpt.get("best_epoch"),
-            "best_val_macro_f1": ckpt.get("best_val_macro_f1"),
-            "duration": ckpt.get("duration"),
-        },
-        "overall": report["overall"],
-        "per_class": report["per_class"],
-        "confusion": report["confusion"],
-        "_note": "Accuracy is inflated by class imbalance; macro_f1 is the headline metric.",
-    }
-    with open(out_dir / "metrics.json", "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2)
-
-    # Per-class table as CSV (nice for the report / spreadsheets).
-    import csv
-    with open(out_dir / "per_class_metrics.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
+    with (out_dir / "per_class_metrics.csv").open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
         w.writerow(["class", "precision", "recall", "f1", "support"])
-        for cls in config.CLASSES:
-            r = report["per_class"][cls]
-            w.writerow([cls, f"{r['precision']:.4f}", f"{r['recall']:.4f}",
-                        f"{r['f1']:.4f}", r["support"]])
+        for name, v in metrics["per_class"].items():
+            w.writerow([name, "%.6f" % v["precision"], "%.6f" % v["recall"],
+                        "%.6f" % v["f1"], v["support"]])
 
-    # ---- figures ----
-    plot_confusion_matrix(report["confusion"], config.CLASSES,
-                          out_dir / "confusion_matrix.png", normalize=True)
-    correct_idx, wrong_idx = pick_examples(idxs, y_true, y_pred, args.n_examples, args.seed)
-    save_example_grid(ds, correct_idx, y_true, y_pred,
-                      out_dir / "examples_correct.png", "Correct predictions")
-    save_example_grid(ds, wrong_idx, y_true, y_pred,
-                      out_dir / "examples_incorrect.png", "Incorrect predictions (true -> pred)")
-    ds.close()
+    with (out_dir / "predictions.csv").open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["gravityspy_id", "true_label", "predicted_label",
+                    "confidence", "correct"])
+        for i, gid in enumerate(results["ids"]):
+            true_name = class_names[int(results["targets"][i])]
+            pred_name = class_names[int(results["preds"][i])]
+            w.writerow([gid, true_name, pred_name,
+                        "%.6f" % results["probs"][i].max(),
+                        int(true_name == pred_name)])
 
-    # ---- console summary ----
-    o = report["overall"]
-    print("\n==== TEST RESULTS ====")
-    print(f"  accuracy    : {o['accuracy']:.4f}   (inflated by imbalance)")
-    print(f"  MACRO-F1    : {o['macro_f1']:.4f}   <- HEADLINE METRIC")
-    print(f"  weighted-F1 : {o['weighted_f1']:.4f}")
-    print(f"  macro P/R   : {o['macro_precision']:.4f} / {o['macro_recall']:.4f}")
-    print(f"\n[eval] artifacts -> {out_dir}")
+    plot_confusion_matrix(metrics["confusion_matrix"], class_names,
+                          out_dir / "confusion_matrix.png",
+                          "%s -- confusion matrix" % args.model)
+
+    mean, std = normalisation_stats(cfg)
+    for correct, filename, title in (
+            (True, "examples_correct.png", "correct predictions"),
+            (False, "examples_incorrect.png", "most confident mistakes")):
+        plot_example_grid(*select_examples(results, args.n_examples, correct),
+                          out_dir / filename, "%s -- %s" % (args.model, title),
+                          mean, std)
+
+    print("-" * 66)
+    print("macro-F1          : %.4f   <-- headline metric" % metrics["macro_f1"])
+    print("accuracy          : %.4f   (inflated by class imbalance)"
+          % metrics["accuracy"])
+    print("balanced accuracy : %.4f" % metrics["balanced_accuracy"])
+    print("weighted-F1       : %.4f" % metrics["weighted_f1"])
+    print("\nweighted-F1 minus macro-F1 = %.4f  (larger gap = rare classes neglected)"
+          % (metrics["weighted_f1"] - metrics["macro_f1"]))
+
+    print("\nweakest classes by F1:")
+    for name, v in sorted(metrics["per_class"].items(), key=lambda kv: kv[1]["f1"])[:5]:
+        print("  %-22s F1=%.3f (support=%d)" % (name, v["f1"], v["support"]))
+
+    print("-" * 66)
+    print("written to %s" % out_dir)
+    print("\nOnce every model is evaluated: python compare.py")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

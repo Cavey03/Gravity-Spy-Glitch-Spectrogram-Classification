@@ -1,0 +1,32 @@
+{
+  "model": "custom_cnn",
+  "pretrained": true,
+  "input_size": [
+    140,
+    170
+  ],
+  "data_root": "C:\\Users\\kylek\\Desktop\\2026 Honours\\AI\\Sem2\\Project\\gravity-spy\\dataset",
+  "duration": "2.0",
+  "epochs": 60,
+  "batch_size": 64,
+  "lr": 0.0003,
+  "weight_decay": 0.0001,
+  "warmup_epochs": 2,
+  "grad_clip": 1.0,
+  "class_weights": true,
+  "early_stopping_patience": 12,
+  "min_epochs": 5,
+  "augment": true,
+  "time_shift_frac": 0.08,
+  "time_mask_frac": 0.12,
+  "freq_mask_frac": 0.12,
+  "brightness": 0.15,
+  "contrast": 0.15,
+  "horizontal_flip": false,
+  "drop_blank_images": false,
+  "seed": 42,
+  "device": "auto",
+  "amp": true,
+  "num_workers": 4,
+  "output_root": "C:\\Users\\kylek\\Desktop\\2026 Honours\\AI\\Sem2\\Project\\gravity-spy\\outputs"
+}
