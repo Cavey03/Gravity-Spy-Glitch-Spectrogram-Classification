@@ -5,7 +5,7 @@
     140,
     170
   ],
-  "data_root": "C:\\Users\\kylek\\Desktop\\2026 Honours\\AI\\Sem2\\Project\\gravity-spy\\dataset",
+  "data_root": "C:\\Users\\kylek\\Desktop\\2026 Honours\\AI\\Sem2\\Project\\gh-repo\\dataset",
   "duration": "2.0",
   "epochs": 60,
   "batch_size": 64,
@@ -28,5 +28,5 @@
   "device": "auto",
   "amp": true,
   "num_workers": 4,
-  "output_root": "C:\\Users\\kylek\\Desktop\\2026 Honours\\AI\\Sem2\\Project\\gravity-spy\\outputs"
+  "output_root": "C:\\Users\\kylek\\Desktop\\2026 Honours\\AI\\Sem2\\Project\\gh-repo\\outputs"
 }
