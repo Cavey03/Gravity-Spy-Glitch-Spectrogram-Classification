@@ -30,6 +30,7 @@ model](#contributing-a-model).
 - [Contributing a model](#contributing-a-model)
 - [Repository layout](#repository-layout)
 - [Design decisions worth knowing](#design-decisions-worth-knowing)
+- [Results](#results)
 - [Reading the results](#reading-the-results)
 - [Troubleshooting](#troubleshooting)
 - [Dataset citation and licence](#dataset-citation-and-licence)
@@ -563,47 +564,46 @@ and `env.json`.
 
 ---
 
-## Results so far
+## Results
 
-`custom_cnn`, trained on the canonical split, evaluated on the canonical
-1,179-image test set (seed 42, RTX 5070, ~6 min):
+All three models on the canonical 1,179-image test set (seed 42, RTX 5070).
+Full figures, tables and analysis are in
+[`notebooks/gravity_spy_project.ipynb`](notebooks/gravity_spy_project.ipynb).
 
-| Metric | Value |
-|---|---|
-| **macro-F1** | **0.9332** |
-| Accuracy | 0.9686 |
-| Balanced accuracy | 0.9267 |
-| weighted-F1 | 0.9684 |
-| macro precision / recall | 0.9511 / 0.9267 |
-| top-3 accuracy | 0.9958 |
-| Parameters | 2,359,542 |
-| Epochs | 57 (best at 45, early-stopped) |
+| Model | Student | **macro-F1** | Accuracy | Balanced acc. | Params | Best epoch |
+|---|---|---|---|---|---|---|
+| Swin-Tiny (`transformer`) | 3 | **0.9421** | 0.9712 | 0.9346 | 27.5M | 15 of 20 |
+| Custom CNN (`custom_cnn`) | 1 | **0.9332** | 0.9686 | 0.9267 | 2.4M | 45 of 57 |
+| EfficientNetV2-S (`transfer_cnn`) | 2 | **0.9323** | 0.9686 | 0.9248 | 20.2M | 14 of 25 |
 
-Accuracy is 96.9%, right in the expected 97–98% band, and 3.5 points above
-macro-F1 — the imbalance gap in one number.
+- **Swin-Tiny scores highest, by 0.009 macro-F1.** That is a few test images,
+  from one training run per model, so treat it as a small edge rather than a
+  settled ranking.
+- **The 2.4M-parameter custom CNN matches the 20M-parameter pretrained
+  EfficientNetV2-S.** ImageNet pretraining gave no clear accuracy gain on
+  spectrograms, but it did converge about three times faster.
+- **Accuracy hardly separates the models** (0.9686–0.9712); macro-F1 does.
 
-**Weakest classes:** `Paired_Doves` 0.667, `None_of_the_Above` 0.750,
-`No_Glitch` 0.818, `Wandering_Line` 0.833.
+### Effect of the blank images
 
-**`Paired_Doves` is entirely explained by the blank-image defect.** Two of its
-four test images contain no data; both were predicted `Extremely_Loud`, and both
-of the *real* `Paired_Doves` images were classified correctly at 0.96 and 1.00
-confidence. Excluding blank images from scoring:
+| Model | macro-F1 | Without the 19 blank test images |
+|---|---|---|
+| Swin-Tiny | 0.9421 | 0.9587 |
+| Custom CNN | 0.9332 | 0.9502 |
+| EfficientNetV2-S | 0.9323 | 0.9491 |
 
-| | macro-F1 | Accuracy | Balanced acc. |
-|---|---|---|---|
-| Canonical test set (reported) | 0.9332 | 0.9686 | 0.9267 |
-| Excluding the 19 blank test images | 0.9502 | 0.9707 | 0.9511 |
+All three models assign all 19 blank test images to `Extremely_Loud`. That is
+why `Paired_Doves` scores exactly 0.667 for every model: its 2 real test images
+are always correct and its 2 blank ones never can be. The defect costs each
+model about 0.017 and does not change the ranking. Report the canonical
+numbers; cite the second column as analysis.
 
-So **0.0169 of macro-F1 is lost to the dataset defect, not to the model**, and
-`Paired_Doves` F1 goes 0.667 → 1.000. Report the canonical number; cite the
-second as analysis.
+### Main confusions
 
-**Genuine confusions worth discussing** (i.e. not blank-image artefacts):
-`Low_Frequency_Burst` ↔ `Low_Frequency_Lines` (7 errors both ways),
-`Low_Frequency_Lines` → `No_Glitch` (3), `Repeating_Blips` → `Blip` (2). These
-are physically sensible — the confused pairs occupy the same frequency band and
-differ mainly in duration and repetition structure.
+The two CNNs mostly confuse `Low_Frequency_Burst` ↔ `Low_Frequency_Lines`;
+Swin-Tiny's most frequent error is `Low_Frequency_Lines` → `No_Glitch`.
+These pairs share a frequency band and differ mainly in duration, which the
+2.0 s window may not capture well.
 
 ## Reading the results
 
