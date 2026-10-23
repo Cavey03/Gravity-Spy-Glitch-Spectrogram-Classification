@@ -15,6 +15,7 @@ import torch
 def collect_env_info() -> Dict[str, Any]:
     import numpy
     import sklearn
+    import timm
 
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none"
     # ITRI626 spec 7.3 requires the GPU model AND its available memory.
@@ -27,6 +28,7 @@ def collect_env_info() -> Dict[str, Any]:
         "torch": torch.__version__,
         "numpy": numpy.__version__,
         "sklearn": sklearn.__version__,
+        "timm": timm.__version__,
         "cuda": torch.version.cuda,
         "gpu": gpu,
         "gpu_memory_gb": gpu_memory_gb,

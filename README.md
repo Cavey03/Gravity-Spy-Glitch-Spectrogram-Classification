@@ -45,10 +45,19 @@ python evaluate.py --model custom_cnn # all metrics + figures
 python compare.py                    # aggregate across models
 ```
 
-No data yet? The whole pipeline runs on synthetic data in under a minute:
+**The full write-up of the data, setup and results is in the notebook**
+[`notebooks/gravity_spy_project.ipynb`](notebooks/gravity_spy_project.ipynb), saved with
+all outputs visible. It loads the trained results from `outputs/`; set `RETRAIN = True`
+at the top to retrain all three models first.
 
 ```bash
-python scripts/smoke_test.py
+jupyter notebook notebooks/gravity_spy_project.ipynb
+```
+
+No data yet? The whole pipeline runs on synthetic data in a couple of minutes:
+
+```bash
+python scripts/smoke_test.py --all-models
 ```
 
 ---
@@ -398,9 +407,12 @@ gravity-spy/
 │   ├── metrics.py          metric suite + class weights
 │   ├── plotting.py         all figures
 │   └── env_info.py         library/GPU version capture
+├── notebooks/
+│   └── gravity_spy_project.ipynb   dataset, setup and results, outputs visible
+├── splits/                 exact train/validation/test lists + blank-image list
 ├── scripts/
 │   └── smoke_test.py       end-to-end run on synthetic data
-└── outputs/                per-model artefacts (git-ignored)
+└── outputs/                per-model results and figures (checkpoints git-ignored)
 ```
 
 ---

@@ -38,3 +38,6 @@ matplotlib>=3.8
 
 # Progress bars (optional -- the code degrades gracefully without it)
 tqdm>=4.66
+
+# Notebook (notebooks/gravity_spy_project.ipynb)
+jupyter>=1.0

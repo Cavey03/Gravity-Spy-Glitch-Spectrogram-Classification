@@ -107,6 +107,12 @@ def denormalise(img: np.ndarray, mean: Sequence[float], std: Sequence[float]) ->
     return np.clip(arr[0], 0.0, 1.0)
 
 
+# The stored arrays are image-style: row 0 is the TOP of the spectrogram, i.e.
+# the HIGHEST frequency. Draw them with origin="upper" so frequency increases
+# upward. origin="lower" would flip every glitch vertically -- a display-only
+# error, but it puts Low_Frequency_Burst at the top and Whistle at the bottom.
+
+
 def plot_example_grid(images, true_labels, pred_labels, confidences, path: Path,
                       title: str, mean, std, ncols: int = 4) -> Path:
     """Example predictions; green title = correct, red = wrong."""
@@ -126,7 +132,7 @@ def plot_example_grid(images, true_labels, pred_labels, confidences, path: Path,
 
     for i in range(n):
         axes[i].imshow(denormalise(images[i], mean, std), cmap="viridis",
-                       aspect="auto", origin="lower")
+                       aspect="auto", origin="upper")
         axes[i].set_title("true: %s\npred: %s (%.2f)"
                           % (true_labels[i], pred_labels[i], confidences[i]),
                           fontsize=7.5,
@@ -149,7 +155,7 @@ def plot_sample_grid(images, labels, path: Path, title: str, ncols: int = 6) -> 
     for ax in axes[n:]:
         ax.axis("off")
     for i in range(n):
-        axes[i].imshow(images[i], cmap="viridis", aspect="auto", origin="lower")
+        axes[i].imshow(images[i], cmap="viridis", aspect="auto", origin="upper")
         axes[i].set_title(labels[i], fontsize=7)
         axes[i].set_xticks([]); axes[i].set_yticks([])
     fig.suptitle(title, fontsize=13)
