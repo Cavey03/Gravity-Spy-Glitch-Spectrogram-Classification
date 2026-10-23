@@ -1,163 +1,134 @@
+"""Dataset sanity check. Run this before training.
+
+    python data/inspect_data.py
+    python data/inspect_data.py --show-augmented
+
+Prints per-class counts per split, checks the split is well formed, reports the
+blank images, and saves figures to outputs/data_inspection/.
 """
-inspect_data.py — Look at the data BEFORE training.
 
-Three jobs:
-  1. Per-class counts per split (train/validation/test) -> see the imbalance.
-  2. --h5-tree : print the real HDF5 layout (handy to confirm the file schema).
-  3. A representative example grid: one real spectrogram per class, saved as a
-     figure so you can eyeball that images and labels are sane.
-
-Run:
-    python -m data.inspect_data                 # counts + example grid
-    python -m data.inspect_data --h5-tree       # also dump the h5 structure
-    python -m data.inspect_data --no-grid       # counts only (fast, no h5 read)
-
-Outputs go to  outputs/inspection/.
-"""
+from __future__ import annotations
 
 import argparse
+import collections
+import csv
+import sys
 from pathlib import Path
+from typing import List, Optional
 
-import matplotlib
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-matplotlib.use("Agg")  # non-interactive backend: save files, never open a window
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
-
-import config
-
-
-# --------------------------------------------------------------------------- #
-# 1. Per-class counts
-# --------------------------------------------------------------------------- #
-def class_counts(metadata_csv: Path) -> pd.DataFrame:
-    """Return a table: rows = 22 classes, cols = train/validation/test/total.
-
-    Built purely from the CSV (no h5 read), so it's instant. Sorted by total
-    descending to make the imbalance obvious at a glance.
-    """
-    df = pd.read_csv(metadata_csv)
-    df["sample_type"] = df["sample_type"].str.strip().str.lower()
-
-    table = (
-        df.groupby(["label", "sample_type"]).size().unstack(fill_value=0)
-    )
-    # Ensure all three split columns exist and are ordered.
-    for col in ["train", "validation", "test"]:
-        if col not in table.columns:
-            table[col] = 0
-    table = table[["train", "validation", "test"]]
-    table["total"] = table.sum(axis=1)
-    # Reindex to the canonical class order, then sort by total for display.
-    table = table.reindex(config.CLASSES, fill_value=0)
-    return table.sort_values("total", ascending=False)
+from config import CLASSES, SPLITS, Config
+from data.dataset import (
+    GravitySpyDataset, assert_no_id_leakage, build_index, counts_by_split,
+    find_blank, split_records,
+)
+from data.transforms import Compose, Resize, build_transforms
+from utils.plotting import plot_class_distribution, plot_sample_grid
+from utils.seeding import set_seed
 
 
-def print_counts(table: pd.DataFrame) -> None:
-    print("\nPer-class counts per split (sorted by total):")
-    print("-" * 60)
-    print(f"{'class':<22}{'train':>8}{'val':>8}{'test':>8}{'total':>8}")
-    print("-" * 60)
-    for cls, row in table.iterrows():
-        print(f"{cls:<22}{row['train']:>8}{row['validation']:>8}"
-              f"{row['test']:>8}{row['total']:>8}")
-    print("-" * 60)
-    print(f"{'TOTAL':<22}{table['train'].sum():>8}{table['validation'].sum():>8}"
-          f"{table['test'].sum():>8}{table['total'].sum():>8}")
-    # Imbalance headline: ratio of biggest to smallest class.
-    biggest, smallest = table["total"].max(), table["total"].min()
-    print(f"\nImbalance ratio (largest / smallest class): "
-          f"{biggest} / {smallest} = {biggest / max(smallest, 1):.1f}x")
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(description="Inspect the Gravity Spy dataset.")
+    p.add_argument("--data-root", type=Path, default=None)
+    p.add_argument("--duration", default=None)
+    p.add_argument("--out-dir", type=Path, default=None)
+    p.add_argument("--show-augmented", action="store_true",
+                   help="Render one image under 8 independent augmentations.")
+    args = p.parse_args(argv)
 
-
-# --------------------------------------------------------------------------- #
-# 2. HDF5 tree
-# --------------------------------------------------------------------------- #
-def print_h5_tree(h5_path: Path, max_examples: int = 2) -> None:
-    import h5py
-
-    print(f"\nHDF5 structure of {h5_path.name}:")
-    with h5py.File(h5_path, "r") as f:
-        top = list(f.keys())
-        print(f"  top-level: {len(top)} groups (class labels), e.g. {top[:3]}")
-        label = top[0]
-        splits = list(f[label].keys())
-        print(f"  f['{label}'] -> {splits}")
-        split = splits[0]
-        ids = list(f[label][split].keys())
-        print(f"  f['{label}']['{split}'] -> {len(ids)} glitch ids, e.g. {ids[:2]}")
-        gid = ids[0]
-        views = list(f[label][split][gid].keys())
-        print(f"  f['{label}']['{split}']['{gid}'] -> {views}")
-        arr = f[label][split][gid][views[0]]
-        print(f"    dataset '{views[0]}': shape={arr.shape} dtype={arr.dtype}")
-
-
-# --------------------------------------------------------------------------- #
-# 3. Example grid
-# --------------------------------------------------------------------------- #
-def example_grid(out_path: Path, split: str = "train") -> None:
-    """Save a grid with one real spectrogram per class (from the given split)."""
-    from data.dataset import GravitySpyDataset
-
-    ds = GravitySpyDataset(split)  # uses config paths
-    # Find the first index for each class so every class is represented.
-    first_idx_per_class = {}
-    for i in range(len(ds)):
-        _, label = ds.get_id_label(i)
-        if label not in first_idx_per_class:
-            first_idx_per_class[label] = i
-        if len(first_idx_per_class) == config.NUM_CLASSES:
-            break
-
-    n = config.NUM_CLASSES
-    cols = 5
-    rows = int(np.ceil(n / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.4, rows * 2.4))
-    axes = axes.ravel()
-    for ax in axes:
-        ax.axis("off")
-
-    for panel, cls in enumerate(config.CLASSES):
-        ax = axes[panel]
-        if cls in first_idx_per_class:
-            img = ds.raw_image(first_idx_per_class[cls])   # (H, W) in [0,1]
-            ax.imshow(img, cmap="viridis", aspect="auto", origin="lower")
-        ax.set_title(cls, fontsize=7)
-    ds.close()
-
-    fig.suptitle(f"One example per class — split='{split}', {config.DURATION}s view",
-                 fontsize=11)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=120)
-    plt.close(fig)
-    print(f"\nSaved example grid -> {out_path}")
-
-
-# --------------------------------------------------------------------------- #
-def main():
-    ap = argparse.ArgumentParser(description="Inspect the Gravity Spy dataset.")
-    ap.add_argument("--h5-tree", action="store_true", help="print the HDF5 layout")
-    ap.add_argument("--no-grid", action="store_true", help="skip the example grid")
-    ap.add_argument("--grid-split", default="train", help="split to draw the grid from")
-    args = ap.parse_args()
-
-    out_dir = config.OUTPUTS_ROOT / "inspection"
-
-    table = class_counts(config.METADATA_CSV)
-    print_counts(table)
+    cfg = Config().apply_overrides(data_root=args.data_root, duration=args.duration)
+    set_seed(cfg.seed)
+    out_dir = Path(args.out_dir or (cfg.output_root / "data_inspection"))
     out_dir.mkdir(parents=True, exist_ok=True)
-    table.to_csv(out_dir / "class_counts.csv")
-    print(f"Saved counts table -> {out_dir / 'class_counts.csv'}")
 
-    if args.h5_tree:
-        print_h5_tree(config.H5_PATH)
+    print("=" * 66)
+    print("Gravity Spy dataset inspection")
+    print("=" * 66)
 
-    if not args.no_grid:
-        example_grid(out_dir / "example_grid.png", split=args.grid_split)
+    records, h5_path = build_index(cfg)
+    print("source     : %s" % h5_path)
+    print("duration   : %ss view" % cfg.duration)
+    print("indexed    : %d glitches\n" % len(records))
+
+    grouped = split_records(records)
+    assert_no_id_leakage(grouped)
+    print("[OK] no glitch id appears in more than one split\n")
+
+    counts = counts_by_split(records)
+    header = "%-24s %8s %12s %8s %8s" % ("Class", "train", "validation", "test", "total")
+    print(header); print("-" * len(header))
+    rows = []
+    totals = {s: 0 for s in SPLITS}
+    for name in CLASSES:
+        vals = [counts[s].get(name, 0) for s in SPLITS]
+        for s, v in zip(SPLITS, vals):
+            totals[s] += v
+        print("%-24s %8d %12d %8d %8d%s"
+              % (name, vals[0], vals[1], vals[2], sum(vals),
+                 "  <-- rare" if sum(vals) < 100 else ""))
+        rows.append([name] + vals + [sum(vals)])
+    print("-" * len(header))
+    print("%-24s %8d %12d %8d %8d"
+          % ("TOTAL", totals["train"], totals["validation"], totals["test"],
+             sum(totals.values())))
+    rows.append(["TOTAL"] + [totals[s] for s in SPLITS] + [sum(totals.values())])
+
+    train_counts = [counts["train"].get(c, 0) for c in CLASSES]
+    print("\nimbalance  : largest training class is %.1fx the smallest (%d vs %d)"
+          % (max(train_counts) / max(min(train_counts), 1),
+             max(train_counts), min(train_counts)))
+    print("             -> class-weighted loss is on; report macro-F1.")
+
+    # Blank images: a defect in the published dataset, reported up front so it
+    # is not discovered halfway through writing up a confusion matrix.
+    print("\nscanning for blank images...")
+    blank = find_blank(records, h5_path)
+    if blank:
+        by_class = collections.Counter(r.label for r in records if r.locator in blank)
+        totals_by_class = {c: sum(counts[s].get(c, 0) for s in SPLITS) for c in CLASSES}
+        print("[WARN] %d/%d images (%.2f%%) are blank -- every pixel identical."
+              % (len(blank), len(records), 100 * len(blank) / len(records)))
+        print("       A dataset defect, not a loading error; most are blank at all")
+        print("       four durations. Kept by default to preserve the canonical")
+        print("       split (--drop-blank-images to omit).")
+        for name, n in by_class.most_common():
+            print("         %-22s %4d / %4d  (%.1f%%)"
+                  % (name, n, totals_by_class[name], 100 * n / totals_by_class[name]))
+
+    with (out_dir / "class_counts.csv").open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["class", "train", "validation", "test", "total"])
+        w.writerows(rows)
+
+    plot_class_distribution(counts, CLASSES, out_dir / "class_distribution.png")
+
+    # One example per class, unnormalised -- this figure should show the data as
+    # it is, not as the network sees it.
+    seen, picks = set(), []
+    for rec in grouped["train"]:
+        if rec.label not in seen:
+            seen.add(rec.label)
+            picks.append(rec)
+    ds = GravitySpyDataset(picks, h5_path, Compose([Resize((140, 170))]))
+    plot_sample_grid([ds[i][0][0].numpy() for i in range(len(ds))],
+                     [CLASSES[ds[i][1]] for i in range(len(ds))],
+                     out_dir / "examples_per_class.png",
+                     "Gravity Spy -- one example per class (%ss view)" % cfg.duration)
+
+    if args.show_augmented:
+        aug = build_transforms(cfg, (140, 170), train=True)
+        aug.transforms = [t for t in aug.transforms if type(t).__name__ != "Normalise"]
+        ds = GravitySpyDataset(grouped["train"][:1], h5_path, aug)
+        plot_sample_grid([ds[0][0][0].numpy() for _ in range(8)],
+                         ["augmented"] * 8, out_dir / "examples_augmented.png",
+                         "One image under 8 augmentations (time shift + "
+                         "SpecAugment + brightness/contrast)", ncols=4)
+
+    print("\nfigures written to %s" % out_dir)
+    print("Next: python train.py --model custom_cnn")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

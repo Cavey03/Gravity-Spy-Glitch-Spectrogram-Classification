@@ -1,251 +1,298 @@
-"""
-train.py — Model-agnostic training loop.
-
-Works for ANY registered model with zero model-specific code beyond the single
-registry call. Usage:
+"""Train a model.
 
     python train.py --model custom_cnn
-    python train.py --model transfer_cnn --epochs 30 --no-class-weights
-    python train.py --model transformer --no-pretrained
+    python train.py --model transfer_cnn --lr 1e-4 --epochs 25
+    python train.py --list-models
 
-What it does:
-  * seeds everything (reproducible)
-  * builds train/val datasets + loaders (Windows num_workers auto-retry)
-  * builds the model via registry.build_model(name, num_classes, pretrained)
-  * class-weighted CrossEntropy (toggleable), AdamW, ReduceLROnPlateau
-  * early stopping on VALIDATION MACRO-F1 (the imbalance-aware metric)
-  * saves best checkpoint + training curves + run snapshot to outputs/<model>/
+Model-agnostic: it asks models/registry.py for a build function and an input
+size by name, and never imports a model module directly. That is what lets a
+teammate add a model without touching this file.
+
+Writes to outputs/<model>/: config.json, env.json, history.json,
+checkpoint_best.pt, checkpoint_last.pt, training_curves.png
 """
 
+from __future__ import annotations
+
 import argparse
-import copy
 import json
+import math
+import sys
 import time
 from pathlib import Path
+from typing import Dict, List, Optional
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import LambdaLR
 
-import config
-from data.dataset import GravitySpyDataset, compute_class_weights
-from models.registry import build_model, available_models
-from utils import reproducibility as repro
-from utils.metrics import headline_metrics
+from config import CLASSES, NUM_CLASSES, Config
+from data.dataset import build_dataloaders
+from models import registry
+from utils.env_info import format_env_summary, save_env_info
+from utils.metrics import compute_class_weights, macro_f1
 from utils.plotting import plot_training_curves
-from utils.seed import make_generator, seed_worker, set_seed
+from utils.seeding import resolve_device, set_seed
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(it, **kw):
+        return it
 
 
-# --------------------------------------------------------------------------- #
-# DataLoader construction with Windows-safe num_workers fallback
-# --------------------------------------------------------------------------- #
-def build_loader(dataset, batch_size, shuffle, num_workers, seed):
-    """Create a DataLoader; if multi-worker startup fails, retry with 0 workers.
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Train a Gravity Spy classifier.")
+    p.add_argument("--model", default=None, help="Registered model name.")
+    p.add_argument("--list-models", action="store_true")
 
-    On Windows, worker processes are *spawned* (the script is re-imported per
-    worker), which occasionally fails for environment reasons. We force the
-    workers to start by pulling one batch inside a try/except; on failure we
-    transparently rebuild single-process (num_workers=0).
+    p.add_argument("--data-root", type=Path, default=None)
+    p.add_argument("--duration", default=None, help="0.5 / 1.0 / 2.0 / 4.0")
+
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
+    p.add_argument("--weight-decay", type=float, default=None)
+    p.add_argument("--warmup-epochs", type=int, default=None)
+    p.add_argument("--patience", dest="early_stopping_patience", type=int, default=None)
+
+    p.add_argument("--no-pretrained", dest="pretrained", action="store_false",
+                   default=None)
+    p.add_argument("--no-class-weights", dest="class_weights", action="store_false",
+                   default=None)
+    p.add_argument("--no-augment", dest="augment", action="store_false", default=None)
+    p.add_argument("--horizontal-flip", action="store_true", default=None,
+                   help="Enable time-reversal augmentation (see data/transforms.py).")
+    p.add_argument("--drop-blank-images", action="store_true", default=None,
+                   help="Exclude the 134 blank images. Off by default so the test "
+                        "set stays canonical; all three models must match.")
+
+    p.add_argument("--input-size", type=int, nargs=2, metavar=("H", "W"), default=None)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--device", choices=("auto", "cuda", "cpu"), default=None)
+    p.add_argument("--no-amp", dest="amp", action="store_false", default=None)
+    p.add_argument("--num-workers", type=int, default=None)
+    p.add_argument("--output-root", type=Path, default=None)
+    return p
+
+
+def build_scheduler(optimizer, cfg: Config) -> LambdaLR:
+    """Linear warmup then cosine decay, as a per-epoch multiplier.
+
+    The warmup exists because the randomly initialised head and the weighted
+    loss both produce large gradients early on, which can knock a pretrained
+    backbone off its weights before it has learned anything.
     """
-    def _make(nw):
-        return DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=nw,
-            worker_init_fn=seed_worker if nw > 0 else None,
-            generator=make_generator(seed),
-            pin_memory=torch.cuda.is_available(),
-            drop_last=False,
-        )
+    warmup = max(0, cfg.warmup_epochs)
 
-    loader = _make(num_workers)
-    if num_workers > 0:
-        try:
-            next(iter(loader))          # force workers to spawn now
-        except Exception as e:          # noqa: BLE001
-            print(f"[train] num_workers={num_workers} failed ({type(e).__name__}); "
-                  "falling back to num_workers=0.")
-            loader = _make(0)
-    return loader
+    def lr_lambda(epoch: int) -> float:
+        if warmup and epoch < warmup:
+            return (epoch + 1) / warmup      # +1 so epoch 0 is not a dead epoch
+        progress = (epoch - warmup) / max(1, cfg.epochs - warmup)
+        return 0.5 * (1.0 + math.cos(math.pi * min(max(progress, 0.0), 1.0)))
+
+    return LambdaLR(optimizer, lr_lambda)
 
 
-# --------------------------------------------------------------------------- #
-# One epoch
-# --------------------------------------------------------------------------- #
-def run_epoch(model, loader, criterion, optimizer, device, train: bool,
-              max_batches=None):
-    """Run one pass. If train=True, updates weights. Returns (avg_loss, y_true, y_pred)."""
-    model.train(train)
-    total_loss, n_seen = 0.0, 0
-    all_true, all_pred = [], []
+def train_one_epoch(model, loader, criterion, optimizer, scaler, device, cfg,
+                    epoch, total_epochs):
+    model.train()
+    running_loss = n_seen = n_correct = 0
+    use_amp = cfg.amp and device.type == "cuda"
+    bar = tqdm(loader, desc="epoch %d/%d" % (epoch, total_epochs), leave=False)
 
-    context = torch.enable_grad() if train else torch.no_grad()
-    with context:
-        for b, (x, y) in enumerate(loader):
-            if max_batches is not None and b >= max_batches:
-                break
-            x, y = x.to(device), y.to(device)
-            if train:
-                optimizer.zero_grad()
-            logits = model(x)
-            loss = criterion(logits, y)
-            if train:
-                loss.backward()
-                optimizer.step()
+    for images, targets, _ in bar:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
 
-            total_loss += loss.item() * x.size(0)
-            n_seen += x.size(0)
-            all_true.extend(y.detach().cpu().tolist())
-            all_pred.extend(logits.detach().argmax(1).cpu().tolist())
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, targets)
 
-    avg_loss = total_loss / max(n_seen, 1)
-    return avg_loss, all_true, all_pred
-
-
-# --------------------------------------------------------------------------- #
-def main():
-    ap = argparse.ArgumentParser(description="Train a Gravity Spy classifier.")
-    ap.add_argument("--model", required=True,
-                    help=f"model name; registered: {available_models()}")
-    ap.add_argument("--epochs", type=int, default=config.EPOCHS)
-    ap.add_argument("--batch-size", type=int, default=config.BATCH_SIZE)
-    ap.add_argument("--lr", type=float, default=config.LEARNING_RATE)
-    ap.add_argument("--weight-decay", type=float, default=config.WEIGHT_DECAY)
-    ap.add_argument("--patience", type=int, default=config.EARLY_STOPPING_PATIENCE)
-    ap.add_argument("--seed", type=int, default=config.SEED)
-    ap.add_argument("--duration", type=float, default=config.DURATION)
-    ap.add_argument("--loader", default=config.LOADER, choices=["h5", "png"])
-    ap.add_argument("--num-workers", type=int, default=config.NUM_WORKERS,
-                    help="DataLoader workers; use 0 on Windows if spawning hangs")
-    # Toggles (store_false so the config default is "on").
-    ap.add_argument("--no-class-weights", action="store_true",
-                    help="disable class-weighted loss")
-    ap.add_argument("--no-aug", action="store_true",
-                    help="disable train augmentation")
-    ap.add_argument("--no-pretrained", action="store_true",
-                    help="build backbone without pretrained weights")
-    # Overrides for quick tests / alternate data locations.
-    ap.add_argument("--h5-path", default=None)
-    ap.add_argument("--metadata-csv", default=None)
-    ap.add_argument("--max-batches", type=int, default=None,
-                    help="cap batches/epoch (smoke tests only)")
-    args = ap.parse_args()
-
-    # ---- reproducibility ----
-    set_seed(args.seed)
-    device = config.get_device()
-    print(f"[train] model={args.model} device={device} seed={args.seed}")
-
-    # ---- config toggles from CLI ----
-    if args.no_aug:
-        config.USE_AUGMENTATION = False   # affects build_transforms(train=True)
-    use_class_weights = config.USE_CLASS_WEIGHTS and not args.no_class_weights
-
-    ds_kwargs = dict(
-        loader=args.loader,
-        duration=args.duration,
-        h5_path=Path(args.h5_path) if args.h5_path else None,
-        metadata_csv=Path(args.metadata_csv) if args.metadata_csv else None,
-    )
-    train_ds = GravitySpyDataset("train", **ds_kwargs)
-    val_ds = GravitySpyDataset("val", **ds_kwargs)
-    print(f"[train] train={len(train_ds)}  val={len(val_ds)}")
-
-    train_loader = build_loader(train_ds, args.batch_size, True,
-                                config.NUM_WORKERS, args.seed)
-    val_loader = build_loader(val_ds, args.batch_size, False,
-                              config.NUM_WORKERS, args.seed)
-
-    # ---- model ----  (the ONLY model-specific line in the whole file)
-    model = build_model(args.model, num_classes=config.NUM_CLASSES,
-                        pretrained=not args.no_pretrained).to(device)
-
-    # ---- loss / optim / scheduler ----
-    if use_class_weights:
-        weights = compute_class_weights(train_ds).to(device)
-        print("[train] class-weighted loss ON")
-    else:
-        weights = None
-        print("[train] class-weighted loss OFF")
-    criterion = nn.CrossEntropyLoss(weight=weights)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                  weight_decay=args.weight_decay)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="max", factor=0.5, patience=3)
-
-    # ---- output dir + run snapshot ----
-    out_dir = config.OUTPUTS_ROOT / args.model
-    out_dir.mkdir(parents=True, exist_ok=True)
-    repro.save_snapshot(
-        repro.snapshot_environment(config, extra=vars(args)),
-        out_dir / "run_config.json",
-    )
-
-    # ---- training loop with early stopping on val macro-F1 ----
-    history = {"train_loss": [], "val_loss": [], "val_accuracy": [], "val_macro_f1": []}
-    best_metric = -1.0
-    best_state = None
-    best_epoch = -1
-    epochs_no_improve = 0
-
-    for epoch in range(1, args.epochs + 1):
-        t0 = time.time()
-        tr_loss, _, _ = run_epoch(model, train_loader, criterion, optimizer,
-                                  device, train=True, max_batches=args.max_batches)
-        va_loss, yt, yp = run_epoch(model, val_loader, criterion, optimizer,
-                                    device, train=False, max_batches=args.max_batches)
-        m = headline_metrics(yt, yp)
-        scheduler.step(m["macro_f1"])
-
-        history["train_loss"].append(tr_loss)
-        history["val_loss"].append(va_loss)
-        history["val_accuracy"].append(m["accuracy"])
-        history["val_macro_f1"].append(m["macro_f1"])
-
-        improved = m["macro_f1"] > best_metric
-        flag = ""
-        if improved:
-            best_metric = m["macro_f1"]
-            best_state = copy.deepcopy(model.state_dict())
-            best_epoch = epoch
-            epochs_no_improve = 0
-            flag = "  <- best"
+        if use_amp:
+            scaler.scale(loss).backward()
+            # Unscale before clipping, or the threshold would apply to
+            # loss-scaled gradients and mean something different each step.
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
         else:
-            epochs_no_improve += 1
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            optimizer.step()
 
-        print(f"epoch {epoch:3d}/{args.epochs}  "
-              f"train_loss={tr_loss:.4f}  val_loss={va_loss:.4f}  "
-              f"val_acc={m['accuracy']:.4f}  val_macroF1={m['macro_f1']:.4f}  "
-              f"({time.time()-t0:.1f}s){flag}")
+        running_loss += loss.item() * targets.size(0)
+        n_seen += targets.size(0)
+        n_correct += (outputs.argmax(1) == targets).sum().item()
 
-        if epochs_no_improve >= args.patience:
-            print(f"[train] early stopping: no macro-F1 improvement for "
-                  f"{args.patience} epochs.")
+    return running_loss / n_seen, n_correct / n_seen
+
+
+@torch.no_grad()
+def validate(model, loader, criterion, device, cfg):
+    model.eval()
+    running_loss = n_seen = 0
+    preds, targets_all = [], []
+    use_amp = cfg.amp and device.type == "cuda"
+
+    for images, targets, _ in tqdm(loader, desc="  val", leave=False):
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            outputs = model(images)
+            loss = criterion(outputs, targets)
+        running_loss += loss.item() * targets.size(0)
+        n_seen += targets.size(0)
+        preds.extend(outputs.argmax(1).cpu().tolist())
+        targets_all.extend(targets.cpu().tolist())
+
+    preds = np.array(preds)
+    targets_all = np.array(targets_all)
+    return (running_loss / n_seen,
+            float((preds == targets_all).mean()),
+            macro_f1(targets_all, preds, NUM_CLASSES))
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.list_models:
+        print("Registered models:\n" + registry.describe_models())
+        return 0
+    if args.model is None:
+        print("error: --model required. Registered models:\n"
+              + registry.describe_models(), file=sys.stderr)
+        return 2
+
+    overrides = {k: v for k, v in vars(args).items()
+                 if k not in ("list_models", "input_size") and v is not None}
+    cfg = Config().apply_overrides(**overrides)
+    if args.input_size:
+        cfg = cfg.apply_overrides(input_size=tuple(args.input_size))
+
+    spec = registry.get_spec(cfg.model)
+    input_size = tuple(cfg.input_size) if cfg.input_size else spec.input_size
+    out_dir = cfg.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Seed before anything that uses randomness: model init, shuffling, augmentation.
+    set_seed(cfg.seed)
+    device = resolve_device(cfg.device)
+
+    env = save_env_info(out_dir / "env.json")
+    print("=" * 66)
+    print("Training '%s'" % cfg.model)
+    print("=" * 66)
+    print(format_env_summary(env))
+    print("device     : %s | input %dx%d | seed %d"
+          % (device, input_size[0], input_size[1], cfg.seed))
+    print("-" * 66)
+
+    loaders, grouped, counts = build_dataloaders(
+        cfg, input_size, splits=("train", "validation"))
+    train_counts = [counts["train"].get(name, 0) for name in CLASSES]
+    print("split      : train=%d validation=%d test=%d"
+          % (len(grouped["train"]), len(grouped["validation"]), len(grouped["test"])))
+    print("imbalance  : %d ... %d  (%.1fx)"
+          % (min(train_counts), max(train_counts),
+             max(train_counts) / max(min(train_counts), 1)))
+
+    model = registry.build_model(cfg.model, NUM_CLASSES, cfg.pretrained).to(device)
+    print("parameters : {:,}".format(sum(p.numel() for p in model.parameters())))
+
+    if cfg.class_weights:
+        weights = compute_class_weights(train_counts)
+        weight_tensor = torch.tensor(weights, device=device)
+        print("weighting  : 1/sqrt(n), range %.2f-%.2f"
+              % (weights.min(), weights.max()))
+    else:
+        weight_tensor = None
+        print("weighting  : disabled")
+
+    criterion = nn.CrossEntropyLoss(weight=weight_tensor)
+    # Validation loss is UNWEIGHTED, so it measures the validation set as it
+    # really is. That is also why early stopping uses macro-F1 rather than val
+    # loss -- the two would otherwise optimise different objectives.
+    val_criterion = nn.CrossEntropyLoss()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr,
+                                  weight_decay=cfg.weight_decay)
+    scheduler = build_scheduler(optimizer, cfg)
+    use_amp = cfg.amp and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+
+    cfg.apply_overrides(input_size=input_size).save(out_dir / "config.json")
+
+    history: Dict[str, object] = {k: [] for k in
+                                  ("train_loss", "train_accuracy", "val_loss",
+                                   "val_accuracy", "val_macro_f1", "lr")}
+    best_f1, best_epoch, stale = -1.0, 0, 0
+
+    print("-" * 66)
+    for epoch in range(1, cfg.epochs + 1):
+        started = time.time()
+        current_lr = optimizer.param_groups[0]["lr"]
+
+        train_loss, train_acc = train_one_epoch(
+            model, loaders["train"], criterion, optimizer, scaler, device, cfg,
+            epoch, cfg.epochs)
+        val_loss, val_acc, val_f1 = validate(
+            model, loaders["validation"], val_criterion, device, cfg)
+
+        # After the optimizer -- stepping first would skip the initial LR.
+        scheduler.step()
+
+        for key, value in (("train_loss", train_loss), ("train_accuracy", train_acc),
+                           ("val_loss", val_loss), ("val_accuracy", val_acc),
+                           ("val_macro_f1", val_f1), ("lr", current_lr)):
+            history[key].append(value)
+
+        improved = val_f1 > best_f1
+        print("epoch %3d/%d | lr %.2e | train %.4f/%.4f | val %.4f/%.4f "
+              "macroF1 %.4f | %4.1fs%s"
+              % (epoch, cfg.epochs, current_lr, train_loss, train_acc,
+                 val_loss, val_acc, val_f1, time.time() - started,
+                 "  *" if improved else ""))
+
+        if improved:
+            best_f1, best_epoch, stale = val_f1, epoch, 0
+            torch.save({"model": cfg.model, "epoch": epoch,
+                        "state_dict": model.state_dict(),
+                        "config": cfg.apply_overrides(input_size=input_size).to_dict(),
+                        "class_names": CLASSES, "input_size": list(input_size),
+                        "val_macro_f1": val_f1},
+                       out_dir / "checkpoint_best.pt")
+        else:
+            stale += 1
+
+        if epoch >= cfg.min_epochs and stale >= cfg.early_stopping_patience:
+            print("early stopping: no improvement for %d epochs" % stale)
             break
 
-    # ---- persist best checkpoint + curves + history ----
-    checkpoint = {
-        "model_name": args.model,
-        "state_dict": best_state if best_state is not None else model.state_dict(),
-        "num_classes": config.NUM_CLASSES,
-        "class_names": config.CLASSES,
-        "pretrained": not args.no_pretrained,
-        "best_epoch": best_epoch,
-        "best_val_macro_f1": best_metric,
-        "duration": args.duration,
-        "loader": args.loader,
-    }
-    torch.save(checkpoint, out_dir / "checkpoint_best.pt")
-    with open(out_dir / "history.json", "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2)
-    plot_training_curves(history, out_dir / "training_curves.png")
+    torch.save({"model": cfg.model, "epoch": len(history["train_loss"]),
+                "state_dict": model.state_dict(),
+                "config": cfg.apply_overrides(input_size=input_size).to_dict(),
+                "class_names": CLASSES, "input_size": list(input_size)},
+               out_dir / "checkpoint_last.pt")
 
-    train_ds.close(); val_ds.close()
-    print(f"[train] done. best val macro-F1={best_metric:.4f} @ epoch {best_epoch}")
-    print(f"[train] artifacts -> {out_dir}")
+    history["best_epoch"] = best_epoch
+    history["best_val_macro_f1"] = best_f1
+    (out_dir / "history.json").write_text(json.dumps(history, indent=2),
+                                          encoding="utf-8")
+    plot_training_curves(history, out_dir / "training_curves.png",
+                         "%s -- training history" % cfg.model)
+
+    print("-" * 66)
+    print("best epoch : %d (val macro-F1 %.4f)" % (best_epoch, best_f1))
+    print("written to : %s" % out_dir)
+    print("\nNext: python evaluate.py --model %s" % cfg.model)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

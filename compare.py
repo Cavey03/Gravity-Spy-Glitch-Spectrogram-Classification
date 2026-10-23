@@ -1,151 +1,130 @@
-"""
-compare.py — Aggregate the three models' metrics into one comparison.
-
-Scans outputs/<model>/metrics.json for every model that has been evaluated and
-produces a side-by-side table. Works with 1, 2, or 3 models present -- missing
-models are simply skipped with a note, so you can compare as teammates finish.
+"""Combine the models' metrics.json files into one comparison.
 
     python compare.py
 
-Outputs (into outputs/):
-    comparison.csv    the table, spreadsheet-friendly
-    comparison.md     the same table as Markdown (drop straight into the report)
-    comparison_macro_f1.png   bar chart of macro-F1 per model (the headline)
+Writes outputs/comparison/: comparison.md, comparison.csv, model_comparison.png
 
-Reminder: MACRO-F1 is the headline metric under heavy imbalance; accuracy is
-shown too but is inflated by the dominant classes.
+Refuses to build a table from models evaluated on different splits or with
+different blank-image settings -- those would be different test sets, and it is
+an easy mistake when three people run things independently.
 """
 
+from __future__ import annotations
+
+import argparse
 import csv
 import json
+import sys
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-import matplotlib
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from config import CLASSES, Config
+from utils.plotting import plot_model_comparison
 
-import config
-
-# Columns pulled from each metrics.json, in display order.
-_COLUMNS = [
-    ("model", "model_name"),
-    ("test_n", "n_samples"),
-    ("accuracy", "overall.accuracy"),
-    ("macro_f1", "overall.macro_f1"),          # <- headline
-    ("weighted_f1", "overall.weighted_f1"),
-    ("macro_precision", "overall.macro_precision"),
-    ("macro_recall", "overall.macro_recall"),
-    ("val_macro_f1", "checkpoint.best_val_macro_f1"),
-]
+NON_MODEL_DIRS = {"comparison", "data_inspection"}
+HEADLINE = [("macro_f1", "macro-F1"), ("accuracy", "Accuracy"),
+            ("balanced_accuracy", "Balanced acc."), ("weighted_f1", "weighted-F1"),
+            ("macro_precision", "macro-P"), ("macro_recall", "macro-R")]
 
 
-def _dig(d: dict, dotted: str):
-    """Fetch a nested value by 'a.b.c' path; return None if absent."""
-    cur = d
-    for part in dotted.split("."):
-        if not isinstance(cur, dict) or part not in cur:
-            return None
-        cur = cur[part]
-    return cur
-
-
-def collect_rows() -> list[dict]:
-    """Read every outputs/<model>/metrics.json into a flat row dict."""
-    rows = []
-    for metrics_path in sorted(config.OUTPUTS_ROOT.glob("*/metrics.json")):
-        with open(metrics_path, encoding="utf-8") as f:
-            data = json.load(f)
-        row = {col: _dig(data, path) for col, path in _COLUMNS}
-        rows.append(row)
-    return rows
-
-
-def _fmt(v) -> str:
-    if v is None:
-        return "-"
-    if isinstance(v, float):
-        return f"{v:.4f}"
-    return str(v)
-
-
-def print_table(rows: list[dict]) -> None:
-    headers = [c for c, _ in _COLUMNS]
-    widths = {h: max(len(h), max((len(_fmt(r[h])) for r in rows), default=0)) for h in headers}
-    line = "  ".join(h.ljust(widths[h]) for h in headers)
-    print("\n" + line)
-    print("-" * len(line))
-    # Sort by macro_f1 descending (None last).
-    for r in sorted(rows, key=lambda r: (r["macro_f1"] is not None, r["macro_f1"] or 0),
-                    reverse=True):
-        print("  ".join(_fmt(r[h]).ljust(widths[h]) for h in headers))
-
-
-def save_csv(rows: list[dict], out_path: Path) -> None:
-    headers = [c for c, _ in _COLUMNS]
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=headers)
-        w.writeheader()
-        for r in rows:
-            w.writerow({h: _fmt(r[h]) for h in headers})
-
-
-def save_markdown(rows: list[dict], out_path: Path) -> None:
-    headers = [c for c, _ in _COLUMNS]
-    lines = ["| " + " | ".join(headers) + " |",
-             "| " + " | ".join("---" for _ in headers) + " |"]
-    for r in sorted(rows, key=lambda r: (r["macro_f1"] is not None, r["macro_f1"] or 0),
-                    reverse=True):
-        lines.append("| " + " | ".join(_fmt(r[h]) for h in headers) + " |")
-    out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def save_bar_chart(rows: list[dict], out_path: Path) -> None:
-    """Bar chart of macro-F1 (and accuracy for context) per model."""
-    named = [r for r in rows if r["macro_f1"] is not None]
-    if not named:
-        return
-    models = [r["model"] for r in named]
-    macro = [r["macro_f1"] for r in named]
-    acc = [r["accuracy"] for r in named]
-
-    x = range(len(models))
-    width = 0.38
-    fig, ax = plt.subplots(figsize=(1.8 * len(models) + 3, 4))
-    ax.bar([i - width / 2 for i in x], macro, width, label="macro-F1 (headline)")
-    ax.bar([i + width / 2 for i in x], acc, width, label="accuracy", alpha=0.6)
-    ax.set_xticks(list(x)); ax.set_xticklabels(models)
-    ax.set_ylim(0, 1); ax.set_ylabel("score")
-    ax.set_title("Model comparison (test set)")
-    ax.legend(); ax.grid(axis="y", alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=130)
-    plt.close(fig)
-
-
-def main():
-    rows = collect_rows()
-    if not rows:
-        print("No metrics found. Run evaluate.py for at least one model first:\n"
-              "    python evaluate.py --model custom_cnn")
-        return
-
-    found = {r["model"] for r in rows}
-    expected = {"custom_cnn", "transfer_cnn", "transformer"}
-    missing = expected - found
-    print(f"Found metrics for: {sorted(found)}")
+def discover(output_root: Path, wanted: Optional[List[str]]) -> Dict[str, Dict[str, Any]]:
+    names = wanted or sorted(d.name for d in output_root.iterdir()
+                             if d.is_dir() and d.name not in NON_MODEL_DIRS)
+    results, missing = {}, []
+    for name in names:
+        path = output_root / name / "metrics.json"
+        if path.exists():
+            results[name] = json.loads(path.read_text(encoding="utf-8"))
+        elif wanted:
+            missing.append(name)
     if missing:
-        print(f"(Not yet evaluated: {sorted(missing)} -- table will fill in as "
-              "teammates finish.)")
+        print("[compare] no metrics.json for: %s (run evaluate.py)" % ", ".join(missing))
+    return results
 
-    print_table(rows)
 
-    out = config.OUTPUTS_ROOT
-    save_csv(rows, out / "comparison.csv")
-    save_markdown(rows, out / "comparison.md")
-    save_bar_chart(rows, out / "comparison_macro_f1.png")
-    print(f"\nSaved -> {out / 'comparison.csv'}, comparison.md, comparison_macro_f1.png")
+def check_consistent(results: Dict[str, Dict[str, Any]]) -> str:
+    """Every model must have been scored on the same test set."""
+    for field, label in (("split", "split"), ("drop_blank_images", "drop-blank-images")):
+        values = {n: m.get(field) for n, m in results.items()}
+        if len(set(values.values())) > 1:
+            raise SystemExit(
+                "Refusing to compare: models disagree on %s, so they were not "
+                "evaluated on the same test set.\n" % label
+                + "\n".join("  %-16s %s" % kv for kv in sorted(values.items()))
+                + "\nRe-run evaluate.py so every model matches.")
+    return next(iter(results.values())).get("split", "unknown")
+
+
+def markdown_table(results: Dict[str, Dict[str, Any]], split: str) -> str:
+    order = sorted(results, key=lambda n: -results[n]["macro_f1"])
+    lines = ["| Model | " + " | ".join(l for _, l in HEADLINE) + " | Params | Epochs |",
+             "|---|" + "---:|" * (len(HEADLINE) + 2)]
+    for name in order:
+        m = results[name]
+        lines.append("| `%s` | %s | %s | %s |"
+                     % (name,
+                        " | ".join("%.4f" % m.get(k, 0.0) for k, _ in HEADLINE),
+                        "{:,}".format(m.get("n_parameters", 0)),
+                        m.get("epochs_trained", "-")))
+    return "\n".join(lines) + (
+        "\n\n*Evaluated on the shared **%s** split, sorted by macro-F1.*\n\n"
+        "**Read macro-F1, not accuracy.** The class distribution is skewed "
+        "enough that accuracy stays around 97%% regardless of how the rare "
+        "classes are handled.\n" % split)
+
+
+def per_class_markdown(results: Dict[str, Dict[str, Any]]) -> str:
+    names = sorted(results, key=lambda n: -results[n]["macro_f1"])
+    support = {c: next((m["per_class"][c]["support"] for m in results.values()
+                        if c in m["per_class"]), 0) for c in CLASSES}
+    lines = ["| Class | Support | " + " | ".join("`%s` F1" % n for n in names) + " |",
+             "|---|---:|" + "---:|" * len(names)]
+    for cls in sorted(CLASSES, key=lambda c: -support[c]):
+        cells = " | ".join("%.3f" % results[n]["per_class"][cls]["f1"] for n in names)
+        lines.append("| %s | %d | %s |" % (cls, support[cls], cells))
+    return "\n".join(lines)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    p = argparse.ArgumentParser(description="Compare evaluated models.")
+    p.add_argument("--models", nargs="*", default=None)
+    p.add_argument("--output-root", type=Path, default=None)
+    args = p.parse_args(argv)
+
+    output_root = Path(args.output_root or Config().output_root)
+    results = discover(output_root, args.models)
+    if not results:
+        print("error: no evaluated models under %s" % output_root, file=sys.stderr)
+        return 2
+
+    split = check_consistent(results)
+    out_dir = output_root / "comparison"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    table = markdown_table(results, split)
+    (out_dir / "comparison.md").write_text(
+        "# Gravity Spy -- model comparison\n\n## Headline metrics\n\n" + table
+        + "\n## Per-class F1\n\n" + per_class_markdown(results) + "\n",
+        encoding="utf-8")
+
+    with (out_dir / "comparison.csv").open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["model"] + [k for k, _ in HEADLINE] + ["n_parameters", "epochs"])
+        for name in sorted(results, key=lambda n: -results[n]["macro_f1"]):
+            m = results[name]
+            w.writerow([name] + ["%.6f" % m.get(k, 0.0) for k, _ in HEADLINE]
+                       + [m.get("n_parameters", ""), m.get("epochs_trained", "")])
+
+    plot_model_comparison(results, out_dir / "model_comparison.png")
+
+    print(table)
+    print("written to %s" % out_dir)
+    if len(results) < 3:
+        print("\n(%d of 3 models evaluated so far.)" % len(results))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

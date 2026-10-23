@@ -1,99 +1,95 @@
-"""
-registry.py — THE INTERFACE CONTRACT for all models in this project.
+"""Model registry -- the one place models are wired into the project.
 
-=============================================================================
-THE CONTRACT (read this if you are adding a model)
-=============================================================================
-Every model file exposes exactly one builder with this signature:
+THE CONTRACT
+Every model file exposes:
 
     build_model(num_classes: int, pretrained: bool) -> torch.nn.Module
 
-and registers it here under a unique string name. train.py and evaluate.py
-take `--model <name>` and work for ANY registered model with ZERO other
-changes. To add a model you write ONE file and add ONE registration line —
-nothing else in the codebase changes.
+and gets one register(...) line at the bottom of this file. train.py and
+evaluate.py look models up by name and never import a model module directly, so
+adding a model means one new file plus one line, and no changes to shared code.
 
-Two equivalent ways to register:
-  1. Decorate the builder in your model file:      @register("my_name")
-  2. Or add a line in _import_models() below to import your module so its
-     decorator runs.
-
-This file must not be imported BY the model files (one-way dependency), which
-keeps imports acyclic.
-=============================================================================
+WHY input_size IS REGISTERED HERE rather than passed to build_model:
+models disagree about what size they accept, and not cosmetically. A CNN with
+global pooling takes anything. ViT-B/16 splits the image into fixed 16x16
+patches with one learned positional embedding each, so a different size means
+interpolating those embeddings. Swin-T needs the feature map divisible by its
+7x7 window at every stage. If size were a build_model argument every model would
+have to honour any size given -- so instead each model declares what it wants
+and the data pipeline resizes to match.
 """
 
-from typing import Callable
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Tuple
 
 import torch.nn as nn
 
-# name -> builder function.  A builder is: (num_classes, pretrained) -> Module
-_REGISTRY: dict[str, Callable[..., nn.Module]] = {}
+
+@dataclass(frozen=True)
+class ModelSpec:
+    name: str
+    build_fn: Callable[[int, bool], nn.Module]
+    input_size: Tuple[int, int]              # (H, W) to feed this model
+    description: str = ""
+    supports_pretrained: bool = True         # False for from-scratch models
 
 
-def register(name: str):
-    """Decorator that adds a builder to the registry under `name`.
-
-    Usage in a model file:
-
-        @register("custom_cnn")
-        def build_model(num_classes: int, pretrained: bool) -> nn.Module:
-            ...
-    """
-    def _wrap(build_fn: Callable[..., nn.Module]):
-        if name in _REGISTRY:
-            raise ValueError(f"Model name {name!r} is already registered.")
-        _REGISTRY[name] = build_fn
-        return build_fn
-    return _wrap
+_REGISTRY: Dict[str, ModelSpec] = {}
 
 
-def _import_models():
-    """Import model modules so their @register decorators execute.
-
-    Import errors for the teammate STUB files are swallowed on purpose: the
-    stubs raise NotImplementedError only when BUILT, not when imported, so they
-    should import fine — but if a teammate's WIP file has a syntax/import error,
-    we don't want it to take down the whole registry for everyone else.
-    """
-    # Fully-implemented models: import eagerly (failure here is a real bug).
-    from models import custom_cnn  # noqa: F401  -> registers "custom_cnn"
-
-    # Teammate models: import defensively so one broken WIP file doesn't block
-    # the others. Each still registers its name when importable.
-    for module_name in ("transfer_cnn", "transformer"):
-        try:
-            __import__(f"models.{module_name}")
-        except Exception as e:  # noqa: BLE001
-            print(f"[registry] note: could not import models.{module_name}: {e}")
+def register(name: str, build_fn, input_size: Tuple[int, int],
+             description: str = "", supports_pretrained: bool = True) -> None:
+    _REGISTRY[name] = ModelSpec(name, build_fn, tuple(input_size),
+                                description, supports_pretrained)
 
 
-_IMPORTED = False
+def available_models() -> List[str]:
+    return sorted(_REGISTRY)
 
 
-def _ensure_imported():
-    global _IMPORTED
-    if not _IMPORTED:
-        _import_models()
-        _IMPORTED = True
-
-
-def build_model(name: str, num_classes: int, pretrained: bool) -> nn.Module:
-    """Build a registered model by name. This is the ONLY entry point callers use.
-
-    train.py / evaluate.py call exactly this and nothing model-specific.
-    """
-    _ensure_imported()
+def get_spec(name: str) -> ModelSpec:
     if name not in _REGISTRY:
         raise KeyError(
-            f"Unknown model {name!r}. Available: {sorted(_REGISTRY)}. "
-            "Add a model by writing models/<name>.py with a build_model() "
-            "decorated @register('<name>'), then import it in registry._import_models()."
-        )
-    return _REGISTRY[name](num_classes=num_classes, pretrained=pretrained)
+            "Unknown model %r. Registered: %s.\nTo add one, write "
+            "models/<name>.py with build_model(num_classes, pretrained) and add "
+            "a register(...) line in models/registry.py."
+            % (name, ", ".join(available_models())))
+    return _REGISTRY[name]
 
 
-def available_models() -> list[str]:
-    """Return the sorted list of registered model names."""
-    _ensure_imported()
-    return sorted(_REGISTRY)
+def get_input_size(name: str) -> Tuple[int, int]:
+    return get_spec(name).input_size
+
+
+def build_model(name: str, num_classes: int, pretrained: bool = True) -> nn.Module:
+    spec = get_spec(name)
+    if pretrained and not spec.supports_pretrained:
+        print("[registry] %r trains from scratch; ignoring pretrained=True." % name)
+        pretrained = False
+    return spec.build_fn(num_classes, pretrained)
+
+
+def describe_models() -> str:
+    return "\n".join(
+        "  %-14s %3dx%-3d  %s" % (s.name, s.input_size[0], s.input_size[1],
+                                  s.description)
+        for s in (_REGISTRY[n] for n in available_models()))
+
+
+# --- registrations ---------------------------------------------------------
+# Imported here, after register() exists, so a model module can import from
+# this file without a circular import.
+
+from models import custom_cnn, transfer_cnn, transformer  # noqa: E402
+
+register("custom_cnn", custom_cnn.build_model, input_size=(140, 170),
+         description="5-block CNN trained from scratch (baseline).",
+         supports_pretrained=False)
+
+register("transfer_cnn", transfer_cnn.build_model, input_size=(224, 224),
+         description="Pretrained CNN via timm (EfficientNetV2-S / ConvNeXt-Tiny).")
+
+register("transformer", transformer.build_model, input_size=(224, 224),
+         description="Pretrained transformer via timm (Swin-Tiny / ViT-B/16).")
