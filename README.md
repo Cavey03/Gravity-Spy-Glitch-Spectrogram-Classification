@@ -1,4 +1,4 @@
-# Gravity Spy — LIGO glitch spectrogram classification
+# Gravity Spy — LIGO glitch spectrogram classification by Kyle Kalin, Morena Themane, and AJ Matlhare
 
 Classifying LIGO **Gravity Spy** glitch spectrograms into **22 classes**. This is
 ordinary supervised image classification: the model only ever sees a spectrogram
